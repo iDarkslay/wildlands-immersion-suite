@@ -4,6 +4,10 @@
 
 First public release.
 
+This release is derived from PhialsBasement's GRW ScriptHook at commit
+`3284ccd0ae84738aaba40964e960c6c9aae9b29b`. See `UPSTREAM_CHANGES.md` for the
+consolidated comparison with that upstream base.
+
 ### Wildlands Mod Framework
 
 - Forked GRW ScriptHook at upstream commit
@@ -19,11 +23,11 @@ First public release.
   user-facing transition-time setting was removed; the legacy framework API
   remains available for compatibility.
 - Added a read-only held-weapon identity cache for stable per-weapon camera
-  alignment without private runtime components.
+  alignment.
 - Corrected model-space Fake_gunroot conversion to use the live pose root
   translation used by the previously validated read-only path.
-- Read the currently published pose buffer on every camera frame, matching the
-  previously working Bridge path instead of retaining a stale bone buffer.
+- Read the currently published pose buffer on every camera frame instead of
+  retaining a stale bone buffer.
 - Select the newest player skeleton actually published by the engine instead
   of assuming the first skeleton-like entity component drives rendered arms.
 - Recompute the current Fake_gunroot world position inside the camera
@@ -31,9 +35,8 @@ First public release.
   phase in the same rendered frame.
 - Removed the separate tooltip accent widget that could remain visible beside
   the first row; the gold left bar now belongs only to the selected row.
-- Removed private bridge integration, disk logging, crash diagnostics, UI
-  dumps, trace recorders and developer-only API endpoints from the public
-  release build.
+- Added deterministic build, dependency checks, exact binary/source mapping,
+  public installation documentation and GPL release records.
 
 ### Wildlands Immersion Suite
 

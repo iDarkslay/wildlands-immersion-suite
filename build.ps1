@@ -22,11 +22,11 @@ try {
     )
     $framework = @(Get-Content -LiteralPath (Join-Path $repo 'framework-sources.txt'))
     foreach ($source in $framework) {
-        if ($source -notmatch '^vendor/grw-scripthook/[a-z_]+\.c$' -or -not (Test-Path -LiteralPath $source)) { throw "Invalid source entry: $source" }
+        if ($source -notmatch '^framework/[a-z_]+\.c$' -or -not (Test-Path -LiteralPath $source)) { throw "Invalid source entry: $source" }
     }
     & $cc @flags -o "$output/dinput8.dll" @framework -ldinput8 -ldxguid -lgdi32 -luser32
     if ($LASTEXITCODE -ne 0) { throw 'Framework compilation failed.' }
-    & $cc @flags -DIMMERSIVE_MOVEMENT_EMBEDDED -DIMMERSIVE_BALLISTICS_EMBEDDED -o "$output/immersion_suite.asi" vendor/grw-scripthook/firstperson.c mods/suite_movement/suite_movement.c mods/suite_ballistics/suite_ballistics.c -lgdi32 -luser32
+    & $cc @flags -I framework -DIMMERSIVE_MOVEMENT_EMBEDDED -DIMMERSIVE_BALLISTICS_EMBEDDED -o "$output/immersion_suite.asi" immersion-suite/immersion_suite.c immersion-suite/movement.c immersion-suite/ballistics.c -lgdi32 -luser32
     if ($LASTEXITCODE -ne 0) { throw 'Suite compilation failed.' }
     foreach ($name in @('dinput8.dll','immersion_suite.asi')) {
         $headers = & $objdump -p (Join-Path $output $name)

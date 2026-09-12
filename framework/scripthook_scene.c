@@ -1,0 +1,622 @@
+/* Wildlands Mod Framework / Immersion Suite fork.
+ * Original GRW ScriptHook portions Copyright (C) 2026 PhialsBasement.
+ * Modifications and additions Copyright (C) 2026 iDarkslay.
+ * Modified through 2026-09-12. SPDX-License-Identifier: GPL-3.0-only.
+ * See LICENSE, NOTICE.md and UPSTREAM_CHANGES.md.
+ */
+/* phoenix::Scenes of our own, one per plugin layer. */
+#include <windows.h>
+#include <string.h>
+#include <stdint.h>
+
+#define SH_BUILD 1
+#include "scripthook.h"
+#include "image.h"
+#include "log.h"
+
+#define F_ALLOC_CTX     SH_IMG(0xE064390)
+#define F_ALLOC         SH_IMG(0x60ACBF0)
+#define G_POOL          SH_IMG(0x4D78D00)
+#define F_SCENE_CTOR    SH_IMG(0x32EEC50)
+#define F_SCENE_DTOR    SH_IMG(0x32EECD0)
+#define F_SCENE_TICK    SH_IMG(0x173FA610)
+#define F_SCENE_FLIP    SH_IMG(0x173FA280)
+#define F_SCENE_RENDER  SH_IMG(0x173F8C60)
+#define F_SCENE_RESIZE  SH_IMG(0x173F8400)
+#define F_SCENE_SETCTX  SH_IMG(0x173F9930)
+#define F_SCENE_SETRES  SH_IMG(0x173F9160)
+#define F_ATTACH        SH_IMG(0x32F4D00)
+#define F_FREE          SH_IMG(0xF93CA90)
+#define F_LOCK          SH_IMG(0x36206D0)
+#define F_UNLOCK        SH_IMG(0x3287730)
+#define RENDER_THUNK    SH_IMG(0x32EEFB0)
+#define G_UIMGR         SH_IMG(0x4D58560)
+#define VT_GAME_RESOLVER SH_IMG(0x3A05AA0)
+
+/* scene private */
+#define SP_STATE     0x368
+#define SP_ROOT      0x3E0
+#define SP_IDX       0x3FC
+#define STATE_LIVE   4
+
+#define TICK_MS      16
+#define JOB_WAIT_MS  3000
+#define HASH_PLAYING 0x8816ABC6u
+#define MAX_SCENES   16
+
+extern uint32_t ShGetGameStateHash(void);
+extern void ShSetError(int err);
+extern int  ShIsInGame(void);
+extern int  ShReadableAddr(uint64_t addr, size_t len);
+extern void *ShAllocNear(uint64_t target);
+extern int  ShQueueCall(uint64_t fn, uint64_t a0, uint64_t a1,
+                        uint64_t a2, uint64_t a3);
+extern int  ShQueueResult(uint64_t *outRet);
+
+typedef uint64_t (__attribute__((ms_abi)) *Fn1)(uint64_t);
+typedef uint64_t (__attribute__((ms_abi)) *Fn3)(uint64_t, uint64_t,
+                                                uint64_t);
+typedef int32_t *(__attribute__((ms_abi)) *Scene2)(uint64_t, int32_t *);
+typedef int32_t *(__attribute__((ms_abi)) *Scene3)(uint64_t, int32_t *,
+                                                   uint64_t);
+
+/* our Localizer, nothing to translate */
+
+static uint64_t __attribute__((ms_abi)) LocDtor(uint64_t self) {
+    (void)self;
+    return 0;
+}
+
+static int32_t *__attribute__((ms_abi)) LocLocalize(uint64_t self,
+        int32_t *res, uint64_t id, uint64_t ctx, uint64_t out) {
+    (void)self; (void)id; (void)ctx; (void)out;
+    *res = 0;
+    return res;
+}
+
+static uint64_t __attribute__((ms_abi)) LocOnText(uint64_t self,
+                                                  uint64_t text) {
+    (void)self; (void)text;
+    return 0;
+}
+
+static void *g_locVt[4] = {
+    (void *)LocDtor, (void *)LocLocalize, (void *)LocOnText,
+    (void *)LocDtor
+};
+static struct { void **vt; } g_localizer = { g_locVt };
+static struct { uint64_t vt; } g_resolver;
+
+/* the scene table */
+
+typedef struct {
+    int      used;
+    int      live;
+    int      order;        /* negative: under the game */
+    int      visible;
+    uint64_t handle, priv, rootH, rootP;
+    uint64_t dead;         /* last session's scene */
+    LONG     flippedFrame; /* flip once per frame */
+} SceneSlot;
+
+static SceneSlot g_s[MAX_SCENES];
+static CRITICAL_SECTION g_slock;
+static int g_slockInit;
+static uint8_t *g_stub;
+static uint8_t g_thunkOrig[5];
+static volatile uint32_t g_lastStamp;
+static volatile int64_t g_lastRender;
+static int64_t g_qpcFreq;
+static volatile LONG g_frame;
+static volatile LONG g_gameHudVisible = 1;
+
+static void SLock(void) {
+    if (!g_slockInit) {
+        InitializeCriticalSection(&g_slock);
+        ((void)0);
+        g_slockInit = 1;
+    }
+    EnterCriticalSection(&g_slock);
+}
+static void SUnlock(void) { LeaveCriticalSection(&g_slock); }
+
+static uint64_t RQ(uint64_t a) {
+    uint64_t v = 0;
+    if (ShReadableAddr(a, 8)) memcpy(&v, (void *)(uintptr_t)a, 8);
+    return v;
+}
+
+static uint64_t EAlloc(size_t size) {
+    uint64_t pool = RQ(G_POOL), ctx, mem;
+    if (!pool) return 0;
+    ctx = ((Fn3)F_ALLOC_CTX)(size, 8, pool);
+    mem = ((Fn3)F_ALLOC)(size, 8, ctx);
+    if (mem) memset((void *)(uintptr_t)mem, 0, size);
+    return mem;
+}
+
+static int IsOurs(uint64_t scene) {
+    int i;
+    for (i = 0; i < MAX_SCENES; i++)
+        if (g_s[i].live && g_s[i].handle == scene) return 1;
+    return 0;
+}
+
+#define RecordCall(scene, renderer, ours) ((void)0)
+
+/* ---- render hook ---- */
+
+static int NewFrame(void) {
+    uint64_t mgr = RQ(G_UIMGR);
+    uint32_t stamp = 0;
+    LARGE_INTEGER now;
+    int fresh;
+
+    if (mgr && ShReadableAddr(mgr + 0xDC, 4))
+        memcpy(&stamp, (void *)(uintptr_t)(mgr + 0xDC), 4);
+    QueryPerformanceCounter(&now);
+    fresh = (stamp != g_lastStamp) ||
+            (now.QuadPart - g_lastRender) * 1000 > 5 * g_qpcFreq;
+    if (fresh) {
+        g_lastStamp = stamp;
+        g_lastRender = now.QuadPart;
+    }
+    return fresh;
+}
+
+/* visible scenes of one sign, lowest order first */
+static void RenderOurs(uint64_t renderer, int negatives) {
+    int done[MAX_SCENES] = {0};
+    int i, pass;
+
+    for (pass = 0; pass < MAX_SCENES; pass++) {
+        int best = -1;
+        for (i = 0; i < MAX_SCENES; i++) {
+            if (done[i] || !g_s[i].live || !g_s[i].visible) continue;
+            if ((g_s[i].order < 0) != (negatives != 0)) continue;
+            if (best < 0 || g_s[i].order < g_s[best].order) best = i;
+        }
+        if (best < 0) return;
+        done[best] = 1;
+        {
+            int32_t r2 = 0, r3 = 0;
+            if (g_s[best].flippedFrame != g_frame) {
+                g_s[best].flippedFrame = g_frame;
+                ((Scene2)F_SCENE_FLIP)(g_s[best].handle, &r2);
+            }
+            RecordCall(g_s[best].handle, renderer, 1);
+            ((Scene3)F_SCENE_RENDER)(g_s[best].handle, &r3, renderer);
+        }
+    }
+}
+
+/* one tick per frame, render thread, before the flip */
+static int64_t g_lastTick;
+
+static void TickAll(void) {
+    LARGE_INTEGER now;
+    int64_t dt;
+    int i;
+
+    QueryPerformanceCounter(&now);
+    dt = g_lastTick ? (now.QuadPart - g_lastTick) * 1000 / g_qpcFreq : TICK_MS;
+    g_lastTick = now.QuadPart;
+    if (dt < 1) dt = 1;
+    if (dt > 100) dt = 100;
+    for (i = 0; i < MAX_SCENES; i++) {
+        int32_t res = 0;
+        if (!g_s[i].live || !g_s[i].visible) continue;
+        ((Scene3)F_SCENE_TICK)(g_s[i].handle, &res, (uint64_t)dt);
+    }
+}
+
+/* The game draws its UI in several passes per frame. */
+/* A repeated scene starts a new pass; the scene before */
+/* it ended the last one. Ours follows every pass end. */
+#define MAX_PASS 8
+#define MAX_SEEN 64
+static uint64_t g_ends[MAX_PASS], g_endsNext[MAX_PASS];
+static int g_nEnds, g_nEndsNext;
+static uint64_t g_seen[MAX_SEEN];
+static int g_nSeen;
+static volatile uint64_t g_prevCall;
+static volatile int g_doneThisFrame;
+
+static int InList(const uint64_t *l, int n, uint64_t v) {
+    int i;
+    for (i = 0; i < n; i++) if (l[i] == v) return 1;
+    return 0;
+}
+
+/* the game scenes rendered last frame: the UI state */
+#define MAX_ACTIVE 64
+static uint64_t g_activeCur[MAX_ACTIVE], g_activePrev[MAX_ACTIVE];
+static int g_nActiveCur, g_nActivePrev;
+
+static void NoteActive(uint64_t scene) {
+    if (g_nActiveCur < MAX_ACTIVE && !InList(g_activeCur, g_nActiveCur, scene))
+        g_activeCur[g_nActiveCur++] = scene;
+}
+
+/* name: root widget's template instance, string at +0x10 */
+#define NAME_CACHE 128
+static struct { uint64_t scene; char name[48]; } g_names[NAME_CACHE];
+static int g_nNames;
+
+static const char *SceneName(uint64_t scene) {
+    uint64_t priv, root, rootP, inst, blk;
+    uint32_t len = 0;
+    int i;
+    for (i = 0; i < g_nNames; i++)
+        if (g_names[i].scene == scene) return g_names[i].name;
+    if (g_nNames >= NAME_CACHE) return "";
+    priv = RQ(scene + 8);
+    root = priv ? RQ(priv + SP_ROOT) : 0;
+    rootP = root ? RQ(root + 0x20) : 0;
+    inst = rootP ? RQ(rootP + 0x150) : 0;
+    blk = inst ? RQ(inst + 0x10) : 0;
+    g_names[g_nNames].scene = scene;
+    g_names[g_nNames].name[0] = 0;
+    if (blk && ShReadableAddr(blk, 12)) {
+        memcpy(&len, (void *)(uintptr_t)blk, 4);
+        if (len > 0 && len < sizeof(g_names[0].name) &&
+            ShReadableAddr(blk + 12, len)) {
+            memcpy(g_names[g_nNames].name, (void *)(uintptr_t)(blk + 12), len);
+            g_names[g_nNames].name[len] = 0;
+        }
+    }
+    return g_names[g_nNames++].name;
+}
+
+SH_API int ShGameSceneActive(const char *name) {
+    int i;
+    if (!name) return 0;
+    for (i = 0; i < g_nActivePrev; i++)
+        if (strcmp(SceneName(g_activePrev[i]), name) == 0) return 1;
+    return 0;
+}
+
+/* The scenes the game drew last frame, as engine handles.
+ * Everything under one is reachable with the ShWidget
+ * calls, so a plugin can read the game's own UI. */
+SH_API int ShGameSceneCount(void) {
+    return g_nActivePrev;
+}
+
+SH_API uint64_t ShGameSceneAt(int i) {
+    if (i < 0 || i >= g_nActivePrev) return 0;
+    return g_activePrev[i];
+}
+
+SH_API int ShGameSceneName(uint64_t scene, char *buf, int n) {
+    const char *nm;
+    if (!buf || n < 1) return 0;
+    nm = SceneName(scene);
+    strncpy(buf, nm, (size_t)n - 1);
+    buf[n - 1] = 0;
+    return buf[0] != 0;
+}
+
+/* The root widget of a scene, ours or the game's. */
+SH_API uint64_t ShSceneRoot(uint64_t scene) {
+    uint64_t priv = RQ(scene + 8);
+    return priv ? RQ(priv + SP_ROOT) : 0;
+}
+
+SH_API int ShGameScenes(char *buf, int n) {
+    int i, used = 0, count = 0;
+    if (!buf || n < 1) return 0;
+    buf[0] = 0;
+    for (i = 0; i < g_nActivePrev; i++) {
+        const char *nm = SceneName(g_activePrev[i]);
+        int l = (int)strlen(nm);
+        if (!l) continue;
+        if (used + l + 2 > n) break;
+        if (used) buf[used++] = ',';
+        memcpy(buf + used, nm, l);
+        used += l;
+        buf[used] = 0;
+        count++;
+    }
+    return count;
+}
+
+SH_API int ShGameHudShow(int visible) {
+    InterlockedExchange(&g_gameHudVisible, visible ? 1 : 0);
+    return 1;
+}
+
+static void PassEnded(uint64_t last) {
+    if (last && g_nEndsNext < MAX_PASS && !InList(g_endsNext, g_nEndsNext, last))
+        g_endsNext[g_nEndsNext++] = last;
+    g_nSeen = 0;
+}
+
+static int32_t *__attribute__((ms_abi)) RenderHook(uint64_t scene,
+        int32_t *res, uint64_t renderer) {
+    int32_t *r;
+    int fresh, passStart = 0;
+
+    if (IsOurs(scene)) {
+        RecordCall(scene, renderer, 1);
+        return ((Scene3)F_SCENE_RENDER)(scene, res, renderer);
+    }
+    RecordCall(scene, renderer, 0);
+    fresh = NewFrame();
+    if (fresh) {
+        PassEnded(g_prevCall);
+        memcpy(g_ends, g_endsNext, sizeof(g_ends));
+        g_nEnds = g_nEndsNext;
+        g_nEndsNext = 0;
+        memcpy(g_activePrev, g_activeCur, sizeof(g_activePrev));
+        g_nActivePrev = g_nActiveCur;
+        g_nActiveCur = 0;
+        g_doneThisFrame = 0;
+        InterlockedIncrement(&g_frame);
+        TickAll();
+        passStart = 1;
+    } else if (InList(g_seen, g_nSeen, scene)) {
+        PassEnded(g_prevCall);
+        passStart = 1;
+    }
+    if (g_nSeen < MAX_SEEN) g_seen[g_nSeen++] = scene;
+    NoteActive(scene);
+    /* under the game: before each pass's first scene */
+    if (passStart && renderer) RenderOurs(renderer, 1);
+    /* Preserve scene tracking for state detection, but suppress only the
+     * game's HUD layers. Our framework scene and MENU_* screens still draw. */
+    if (!g_gameHudVisible && strncmp(SceneName(scene), "HUD_", 4) == 0) {
+        if (res) *res = 0;
+        r = res;
+    } else {
+        r = ((Scene3)F_SCENE_RENDER)(scene, res, renderer);
+    }
+    g_prevCall = scene;
+    /* over the game: after each pass's last scene */
+    if (renderer) {
+        int hit = g_nEnds ? InList(g_ends, g_nEnds, scene) : !g_doneThisFrame;
+        if (hit) {
+            g_doneThisFrame = 1;
+            RenderOurs(renderer, 0);
+        }
+    }
+    return r;
+}
+
+/* rel32 of the 5 byte jmp thunk, pointed at a near stub */
+static int InstallHook(void) {
+    uint8_t *t = (uint8_t *)(uintptr_t)RENDER_THUNK;
+    int64_t cur, rel;
+    DWORD old;
+    int o = 0;
+
+    if (g_stub) return 1;
+    if (!ShReadableAddr(RENDER_THUNK, 5) || t[0] != 0xE9) return 0;
+    cur = (int64_t)RENDER_THUNK + 5 + *(int32_t *)(t + 1);
+    if ((uint64_t)cur != F_SCENE_RENDER) return 0;
+
+    g_stub = (uint8_t *)ShAllocNear(RENDER_THUNK);
+    if (!g_stub) return 0;
+    memset(g_stub, 0xCC, 0x1000);
+    g_stub[o++] = 0x48; g_stub[o++] = 0xB8;
+    *(uint64_t *)(g_stub + o) = (uint64_t)(uintptr_t)RenderHook; o += 8;
+    g_stub[o++] = 0xFF; g_stub[o++] = 0xE0;
+
+    rel = (int64_t)(uintptr_t)g_stub - ((int64_t)RENDER_THUNK + 5);
+    if (rel > 0x7FFFFFFFLL || rel < -0x7FFFFFFFLL) return 0;
+    if (!VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &old)) return 0;
+    memcpy(g_thunkOrig, t, 5);
+    *(int32_t *)(t + 1) = (int32_t)rel;
+    VirtualProtect(t, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), t, 5);
+    return 1;
+}
+
+/* ---- jobs on the game thread ---- */
+
+static void DestroyEngineScene(uint64_t scene) {
+    ((Fn3)F_SCENE_DTOR)(scene, 0, 0);
+    ((Fn1)F_FREE)(scene);
+    ((void)0);
+}
+
+static uint64_t __attribute__((ms_abi)) CreateJob(uint64_t sid, uint64_t b,
+                                                  uint64_t c, uint64_t d) {
+    SceneSlot *s = &g_s[sid - 1];
+    uint64_t scene, priv, root, rootP;
+    int32_t res = 0;
+    uint8_t idx;
+    (void)b; (void)c; (void)d;
+
+    if (s->dead) { DestroyEngineScene(s->dead); s->dead = 0; }
+
+    scene = EAlloc(0x10);
+    if (!scene) return 0;
+    ((Fn1)F_SCENE_CTOR)(scene);
+    priv = RQ(scene + 8);
+    if (!priv) return 0;
+    ((Scene3)F_SCENE_SETCTX)(scene, &res, (uint64_t)(uintptr_t)&g_localizer);
+    /* the game's name resolver passes texture names through */
+    g_resolver.vt = VT_GAME_RESOLVER;
+    ((Scene3)F_SCENE_SETRES)(scene, &res, (uint64_t)(uintptr_t)&g_resolver);
+    ((Scene2)F_SCENE_RESIZE)(scene, &res);
+    root = RQ(priv + SP_ROOT);
+    rootP = RQ(root + 0x20);
+    if (!root || !rootP) return 0;
+    if (RQ(rootP + 0x130) != scene)
+        ((Fn3)F_ATTACH)(rootP, scene, 0);
+    idx = *(uint8_t *)(uintptr_t)(priv + SP_IDX);
+    *(uint8_t *)(uintptr_t)(priv + SP_STATE + idx) = STATE_LIVE;
+
+    if (!InstallHook()) { ((void)0); return 0; }
+    s->handle = scene; s->priv = priv;
+    s->rootH = root; s->rootP = rootP;
+    s->flippedFrame = -1;
+    s->live = 1;
+    ((void)0);
+    return 1;
+}
+
+static uint64_t __attribute__((ms_abi)) DestroyJob(uint64_t sid, uint64_t b,
+                                                   uint64_t c, uint64_t d) {
+    SceneSlot *s = &g_s[sid - 1];
+    (void)b; (void)c; (void)d;
+    if (s->dead) { DestroyEngineScene(s->dead); s->dead = 0; }
+    if (s->live) {
+        s->live = 0;
+        DestroyEngineScene(s->handle);
+    }
+    memset(s, 0, sizeof(*s));
+    return 1;
+}
+
+static int RunJob(uint64_t fn, uint64_t sid) {
+    uint64_t ret = 0;
+    int waited = 0;
+
+    while (!ShQueueCall(fn, sid, 0, 0, 0)) {
+        if (++waited > JOB_WAIT_MS) return 0;
+        Sleep(1);
+    }
+    while (!ShQueueResult(&ret)) {
+        if (++waited > JOB_WAIT_MS) return 0;
+        Sleep(1);
+    }
+    return ret != 0;
+}
+
+/* physics step entry: only until the first render */
+void ShSceneTick(void) {
+    int i;
+
+    if (g_frame != 0) return;
+    for (i = 0; i < MAX_SCENES; i++) {
+        int32_t res = 0;
+        if (!g_s[i].live || !g_s[i].visible) continue;
+        ((Scene3)F_SCENE_TICK)(g_s[i].handle, &res, TICK_MS);
+    }
+}
+
+/* ---- table API for scripthook_ui.c ---- */
+
+static int Playing(void) {
+    return ShIsInGame() && ShGetGameStateHash() == HASH_PLAYING;
+}
+
+static void Init(void) {
+    LARGE_INTEGER f;
+    if (!g_qpcFreq) {
+        QueryPerformanceFrequency(&f);
+        g_qpcFreq = f.QuadPart;
+    }
+}
+
+int ShSceneAlloc(int order) {
+    int i;
+    Init();
+    SLock();
+    for (i = 0; i < MAX_SCENES; i++) {
+        if (g_s[i].used) continue;
+        memset(&g_s[i], 0, sizeof(g_s[i]));
+        g_s[i].used = 1;
+        g_s[i].order = order;
+        g_s[i].visible = 1;
+        SUnlock();
+        return i + 1;
+    }
+    SUnlock();
+    ShSetError(SH_ERR_NO_CANDIDATE);
+    return 0;
+}
+
+static SceneSlot *Slot(int sid) {
+    if (sid < 1 || sid > MAX_SCENES || !g_s[sid - 1].used) {
+        ShSetError(SH_ERR_BAD_ARG);
+        return NULL;
+    }
+    return &g_s[sid - 1];
+}
+
+int ShSceneEnsure(int sid, uint64_t *scene, uint64_t *rootH,
+                  uint64_t *rootP) {
+    SceneSlot *s = Slot(sid);
+    Init();
+    if (!s) return 0;
+    if (!s->live) {
+        if (!Playing()) { ShSetError(SH_ERR_UI_NOT_READY); return 0; }
+        if (!RunJob((uint64_t)(uintptr_t)CreateJob, (uint64_t)sid)) {
+            ShSetError(SH_ERR_HOOK_FAILED);
+            return 0;
+        }
+    }
+    *scene = s->handle; *rootH = s->rootH; *rootP = s->rootP;
+    return 1;
+}
+
+int ShSceneLive(int sid) {
+    return sid >= 1 && sid <= MAX_SCENES && g_s[sid - 1].live;
+}
+
+int ShSceneRelease(int sid) {
+    if (!Slot(sid)) return 0;
+    if (!RunJob((uint64_t)(uintptr_t)DestroyJob, (uint64_t)sid)) {
+        ShSetError(SH_ERR_HOOK_FAILED);
+        return 0;
+    }
+    return 1;
+}
+
+int ShSceneSetOrder(int sid, int order) {
+    SceneSlot *s = Slot(sid);
+    if (!s) return 0;
+    s->order = order;
+    return 1;
+}
+
+int ShSceneShow(int sid, int visible) {
+    SceneSlot *s = Slot(sid);
+    if (!s) return 0;
+    s->visible = visible ? 1 : 0;
+    return 1;
+}
+
+uint64_t ShScenePriv(int sid) {
+    return ShSceneLive(sid) ? g_s[sid - 1].priv : 0;
+}
+
+uint64_t ShSceneDeadPriv(int sid) {
+    if (sid < 1 || sid > MAX_SCENES || !g_s[sid - 1].dead) return 0;
+    return RQ(g_s[sid - 1].dead + 8);
+}
+
+/* world reload: scenes stop, destroyed on next ensure */
+void ShSceneInvalidate(void) {
+    int i;
+    SLock();
+    for (i = 0; i < MAX_SCENES; i++) {
+        if (!g_s[i].live) continue;
+        ((void)0);
+        if (g_s[i].dead) DestroyEngineScene(g_s[i].dead);
+        g_s[i].dead = g_s[i].handle;
+        g_s[i].live = 0;
+    }
+    SUnlock();
+}
+
+/* the engine's pool free */
+void ShSceneFree(uint64_t p) {
+    if (p) ((Fn1)F_FREE)(p);
+}
+
+SH_API uint64_t ShSceneHandle(void) {
+    return ShSceneLive(1) ? g_s[0].handle : 0;
+}
+
+/* the scene's own critical section at priv+0x370 */
+void ShSceneLock(uint64_t priv) {
+    if (priv) ((Fn1)F_LOCK)(priv + 0x370);
+}
+
+void ShSceneUnlock(uint64_t priv) {
+    if (priv) ((Fn1)F_UNLOCK)(priv + 0x370);
+}

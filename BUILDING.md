@@ -6,12 +6,16 @@
 - x86_64 MinGW-w64 GCC compatible with GCC 16.1.0
 - `gcc.exe` and the matching `objdump.exe` in the same directory
 
-The release candidate was built with:
+Version 0.1.0 was built with:
 
 `gcc.exe (MinGW-W64 x86_64-ucrt-posix-seh, built by Brecht Sanders, r2) 16.1.0`
 
-No proprietary SDK, generated source, private bridge, prebuilt import library,
-network service or game file is required.
+No proprietary SDK, generated source, prebuilt import library, network service
+or game file is required.
+
+`dinput8.dll` starts in `framework/loader.c`. Its DirectInput handling is in
+`framework/scripthook_dinput.c`; every translation
+unit compiled into the DLL is listed in `framework-sources.txt`.
 
 ## Command
 
