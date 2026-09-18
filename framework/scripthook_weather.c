@@ -16,22 +16,22 @@
 #include "image.h"
 
 /* Served by the env object each frame. */
-#define WX_RECORD   SH_IMG(0x4495E90)
+#define WX_RECORD SH_IMG(0x4495eb0)
 #define REC_ENV     0x00
 #define REC_TIME    0x08   /* hours */
 
-#define ENV_VTABLE  SH_IMG(0x39D20B8)
+#define ENV_VTABLE SH_IMG(0x39d1f78)
 #define ENV_TYPE    0x130
-#define TIME_MGR    SH_IMG(0x4B9B4F8)
+#define TIME_MGR SH_IMG(0x4b9b588)
 #define TM_GET      0x270
 #define TM_SET      0x274
 
 /* ChangeTimeAndWeather node: its time half. */
-#define OBJ_FACTORY   SH_IMG(0xE0E0C70)
-#define CTW_OP_DESC   SH_IMG(0x49E2AF0)
-#define CTW_DATA_DESC SH_IMG(0x49E2A50)
-#define CTW_START     SH_IMG(0x2827B50)
-#define WX_SET_DURATION SH_IMG(0xC8F96F0)
+#define OBJ_FACTORY SH_IMG(0xe536f10)
+#define CTW_OP_DESC SH_IMG(0x49e2b70)
+#define CTW_DATA_DESC SH_IMG(0x49e2ad0)
+#define CTW_START SH_IMG(0x2827f10)
+#define WX_SET_DURATION SH_IMG(0xc6a0400)
 
 #define D_WEATHER_ON 0x60
 #define D_MODE       0x70
