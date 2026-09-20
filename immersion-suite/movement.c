@@ -11,12 +11,12 @@
 /*
  * Wildlands Immersion Suite movement feature
  *
- * Independent in-process implementation for GRW build 133.1.0.9840374
- * (Steam build 24669148). No third-party runtime source is included.
+ * Independent in-process implementation for the post-2026-09-15 GRW
+ * update (Steam build 25120584). No third-party runtime source is included.
  */
 
-#define CONTROL_SITE_RVA 0x13FDB762ULL
-#define MAGNITUDE_FN_RVA 0x007D2800ULL
+#define CONTROL_SITE_RVA 0x139452C2ULL
+#define MAGNITUDE_FN_RVA 0x007D2EB0ULL
 #define CAVE_SIZE 0x1000
 #define SCALE_OFFSET 0x40
 #define MIN_LEVEL 15

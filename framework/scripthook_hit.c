@@ -19,13 +19,13 @@
 /* Inside FUN_154D38550, after its casts, where MOV RCX,RDI
  * has just put the projectile in RCX.
  */
-#define HIT_SITE      SH_IMG(0x14D387E3)
-#define HIT_ORIG_CALL SH_IMG(0x29B4970)
+#define HIT_SITE SH_IMG(0x14703f83)
+#define HIT_ORIG_CALL SH_IMG(0x29b4e00)
 /* Common damage-projectile trajectory update. The 14 displaced bytes write
  * the new position and form the segment consumed by the later ray casts. */
-#define VELOCITY_SITE_FIRST SH_IMG(0x14D3D6F9)
-#define VELOCITY_SITE_STEP  SH_IMG(0x14D3D803)
-#define VELOCITY_SITE_TRAIL SH_IMG(0x029CF9BE)
+#define VELOCITY_SITE_FIRST SH_IMG(0x147094e9)
+#define VELOCITY_SITE_STEP SH_IMG(0x147095f3)
+#define VELOCITY_SITE_TRAIL SH_IMG(0x14756f1e)
 
 #define PROJ_LIST     0xA60
 #define PROJ_COUNT    0xA6A
@@ -134,7 +134,7 @@ static int WantsHit(const ShHit *hit, int flags) {
 /* Verified live: every Entity carries this vtable. Without
  * the check, junk handles pass as entities.
  */
-#define VT_ENTITY SH_IMG(0x39C6FC8)
+#define VT_ENTITY SH_IMG(0x39c6df8)
 
 static int IsEntity(uint64_t p) {
     if (!p || (p & 7) || !ShReadableAddr(p, 0x140)) return 0;
